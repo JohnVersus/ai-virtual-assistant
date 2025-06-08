@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-from .settings import save_settings, load_settings
+from ..config.settings import save_settings, load_settings
 
 class ModernUI(tk.Tk):
     def __init__(self, listener_callback):
