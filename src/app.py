@@ -1,138 +1,97 @@
 # src/app.py
+import asyncio
 import threading
 import time
-from .ui.gui import ModernUI
+from .ui.chat_gui import ChatUI
 from .core.listener import AssistantListener
+from .core.dspy_handler import DspyHandler
 from .config.settings import load_settings
-import src.services.llm_service as llm
-import src.services.tts_service as tts
 
-def main():
-    settings = load_settings()
-    assistant_name = settings.get('assistant_name', 'gemini')
+class Application:
+    def __init__(self, root):
+        self.root = root
+        self.settings = load_settings()
+        self.assistant_name = self.settings.get('assistant_name', 'gemini')
 
-    app = ModernUI()
-    
-    wait_timer = None
-    conversation_mode = False
-    
-    def cancel_wait_timer():
-        """Cancel the current wait timer if it exists"""
-        nonlocal wait_timer
-        if wait_timer:
-            wait_timer.cancel()
-            wait_timer = None
-    
-    def start_wait_timer():
-        """Start a 15-second timer before returning to wake word listening"""
-        nonlocal wait_timer
-        cancel_wait_timer()
-        
-        def return_to_wake_listening():
-            """
-            This function is called by the timer. It just sets the flag
-            to signal the continuous_listen thread to stop.
-            """
-            nonlocal conversation_mode
-            conversation_mode = False
-        
-        wait_timer = threading.Timer(15.0, return_to_wake_listening)
-        wait_timer.start()
+        self.dspy_handler = DspyHandler()
+        self.listener = AssistantListener(assistant_name=self.assistant_name, callback=self.on_wake_word)
 
-    def handle_interaction():
-        """This function runs on a separate thread to avoid deadlocks."""
-        nonlocal conversation_mode
-        
-        if not conversation_mode:
-            listener.stop()
-            time.sleep(1)
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.run_async_loop, daemon=True)
+        self.thread.start()
 
-        app.after(0, lambda: app.set_status("Listening for command...", "listening"))
-        command = listener.listen_and_transcribe()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.listener.start()
+        self.root.set_status(f"Listening for '{self.assistant_name}'...")
 
-        if command:
-            app.after(0, lambda: app.set_status("Processing...", "thinking"))
-            response_text = llm.get_response(command)
+    def run_async_loop(self):
+        """Runs the asyncio event loop in a separate thread."""
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
 
-            if response_text:
-                app.after(0, lambda: app.set_status("Speaking...", "speaking"))
-                tts.speak(response_text)
-                
-                conversation_mode = True
-                app.after(0, lambda: app.set_status("Listening... (15s auto-sleep)", "waiting"))
-                
-                threading.Thread(target=continuous_listen, daemon=True).start()
-                start_wait_timer()
-            else:
-                app.after(0, lambda: app.set_status("Sorry, couldn't process that", "listening"))
-                if not conversation_mode:
-                    listener.start()
-        else:
-            app.after(0, lambda: app.set_status("No command heard", "listening"))
-            if not conversation_mode:
-                listener.start()
+    def on_wake_word(self):
+        """Callback triggered when the wake word is detected."""
+        # This function is called from the listener's thread.
+        # We start command handling in a new thread to avoid blocking.
+        threading.Thread(target=self.handle_command, daemon=True).start()
 
-    def continuous_listen():
-        """
-        Continuously listen for commands in conversation mode.
-        When this loop ends, it's responsible for restarting the wake listener.
-        """
-        while conversation_mode:
-            try:
-                command = listener.listen_and_transcribe()
-                if command and conversation_mode:
-                    cancel_wait_timer()
-                    
-                    app.after(0, lambda: app.set_status("Processing...", "thinking"))
-                    response_text = llm.get_response(command)
-                    
-                    if response_text:
-                        app.after(0, lambda: app.set_status("Speaking...", "speaking"))
-                        tts.speak(response_text)
-                        
-                        if conversation_mode:
-                            app.after(0, lambda: app.set_status("Listening... (15s auto-sleep)", "waiting"))
-                            start_wait_timer()
-                    else:
-                        app.after(0, lambda: app.set_status("Sorry, couldn't process that", "waiting"))
-                        if conversation_mode:
-                            start_wait_timer()
-                            
-            except Exception as e:
-                print(f"Error in continuous listen: {e}")
-                time.sleep(0.5)
-        
+    def handle_command(self):
+        """Stops background listening, transcribes a command, and processes it."""
         # --- FIX STARTS HERE ---
-        # Conversation mode has ended (either by timer or error).
-        # This thread is now responsible for safely returning to wake word listening.
-        listener.start()
-        app.after(0, lambda: app.set_status(f"Listening for '{assistant_name}'", "listening"))
+        # 1. Stop the background listener to free up the microphone.
+        self.listener.stop()
+        print("Wake word detected! Stopped background listening.")
+        self.root.set_status("Listening for command...")
+        
+        # A brief pause can sometimes help ensure the resource is fully released.
+        time.sleep(0.1) 
+        
+        # 2. Now, safely listen for and transcribe the command.
+        command = self.listener.listen_and_transcribe()
+        
+        if command:
+            self.root.set_status("Processing...")
+            self.root.add_message("You", command)
+            
+            # 3. Schedule the async streaming task. The listener will be restarted there.
+            asyncio.run_coroutine_threadsafe(self.stream_response(command), self.loop)
+        else:
+            self.root.set_status(f"No command heard. Restarting listener...")
+            print("No command heard. Restarting background listener.")
+            # 4. If no command, restart the background listener immediately.
+            self.listener.start()
         # --- FIX ENDS HERE ---
 
-    def on_wake_word():
-        """
-        This callback runs on the listener thread.
-        """
-        cancel_wait_timer()
-        interaction_thread = threading.Thread(target=handle_interaction, daemon=True)
-        interaction_thread.start()
+    async def stream_response(self, command):
+        """Streams the LLM response to the UI and restarts the listener."""
+        self.root.start_assistant_message()
+        try:
+            async for chunk in self.dspy_handler.get_streamed_response(command):
+                self.root.update_assistant_message(chunk)
+            self.root.end_assistant_message()
+        except Exception as e:
+            print(f"Error streaming response: {e}")
+            self.root.update_assistant_message(f"\n[Error: {e}]")
+        finally:
+            self.root.set_status(f"Done. Listening for '{self.assistant_name}'...")
+            print("Response finished. Restarting background listener.")
+            # --- FIX ---
+            # 5. Crucially, restart the background listener after processing is complete.
+            self.listener.start()
+            # --- END FIX ---
 
-    listener = AssistantListener(assistant_name=assistant_name, callback=on_wake_word)
-
-    def on_closing():
+    def on_closing(self):
+        """Handles application cleanup and shutdown."""
         print("Closing application...")
-        nonlocal conversation_mode
-        conversation_mode = False
-        cancel_wait_timer()
-        listener.stop()
-        app.destroy()
+        self.listener.stop()
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        # self.thread.join() # This can sometimes cause a hang on close, can be omitted.
+        self.root.destroy()
 
-    app.protocol("WM_DELETE_WINDOW", on_closing)
-
-    listener.start()
-    app.set_status(f"Listening for '{assistant_name}'", "listening")
-
-    app.mainloop()
+def main():
+    root = ChatUI()
+    app = Application(root)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()

@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "dspy-ai>=2.6.27",
     "elevenlabs>=2.3.0",
     "google-genai>=1.19.0",
     "py2app>=0.28.8",
