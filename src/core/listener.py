@@ -28,7 +28,7 @@ class AssistantListener:
     def _listen_for_wake_word(self, recognizer, audio):
         try:
             text = recognizer.recognize_google(audio)
-            print(f"Heard: {text}") 
+            print(f"Heard: {text}")
             if self.assistant_name in text.lower():
                 print(f"Activation word '{self.assistant_name}' detected!")
                 self.callback()
@@ -42,7 +42,7 @@ class AssistantListener:
         try:
             with self.microphone as source:
                 audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
-            
+
             text = self.recognizer.recognize_google(audio)
             print(f"Command transcribed: '{text}'")
             return text

@@ -17,7 +17,10 @@ def speak(text: str):
 
         client = ElevenLabs(api_key=api_key)
         
-        audio = client.generate(text=text, voice=voice_id)
+        audio = client.text_to_speech.convert(
+            text=text,
+            voice_id=voice_id
+        )
         
         play(audio)
 
