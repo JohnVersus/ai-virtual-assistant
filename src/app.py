@@ -13,7 +13,6 @@ def main():
 
     app = ModernUI()
     
-    # Timer for automatic return to wake word listening
     wait_timer = None
     conversation_mode = False
     
@@ -26,13 +25,16 @@ def main():
     
     def start_wait_timer():
         """Start a 15-second timer before returning to wake word listening"""
-        nonlocal wait_timer, conversation_mode
+        nonlocal wait_timer
         cancel_wait_timer()
         
         def return_to_wake_listening():
+            """
+            This function is called by the timer. It just sets the flag
+            to signal the continuous_listen thread to stop.
+            """
             nonlocal conversation_mode
             conversation_mode = False
-            app.after(0, lambda: app.set_status(f"Listening for '{assistant_name}'", "listening"))
         
         wait_timer = threading.Timer(15.0, return_to_wake_listening)
         wait_timer.start()
@@ -41,7 +43,6 @@ def main():
         """This function runs on a separate thread to avoid deadlocks."""
         nonlocal conversation_mode
         
-        # Only stop listener if we're not in conversation mode
         if not conversation_mode:
             listener.stop()
             time.sleep(1)
@@ -57,14 +58,10 @@ def main():
                 app.after(0, lambda: app.set_status("Speaking...", "speaking"))
                 tts.speak(response_text)
                 
-                # Enter conversation mode and start listening immediately
                 conversation_mode = True
                 app.after(0, lambda: app.set_status("Listening... (15s auto-sleep)", "waiting"))
                 
-                # Start the continuous listening in conversation mode
                 threading.Thread(target=continuous_listen, daemon=True).start()
-                
-                # Start timer for auto-return to wake word mode
                 start_wait_timer()
             else:
                 app.after(0, lambda: app.set_status("Sorry, couldn't process that", "listening"))
@@ -76,12 +73,14 @@ def main():
                 listener.start()
 
     def continuous_listen():
-        """Continuously listen for commands in conversation mode"""
+        """
+        Continuously listen for commands in conversation mode.
+        When this loop ends, it's responsible for restarting the wake listener.
+        """
         while conversation_mode:
             try:
                 command = listener.listen_and_transcribe()
                 if command and conversation_mode:
-                    # Cancel the timer since user responded
                     cancel_wait_timer()
                     
                     app.after(0, lambda: app.set_status("Processing...", "thinking"))
@@ -91,7 +90,7 @@ def main():
                         app.after(0, lambda: app.set_status("Speaking...", "speaking"))
                         tts.speak(response_text)
                         
-                        if conversation_mode:  # Check if still in conversation mode
+                        if conversation_mode:
                             app.after(0, lambda: app.set_status("Listening... (15s auto-sleep)", "waiting"))
                             start_wait_timer()
                     else:
@@ -102,11 +101,17 @@ def main():
             except Exception as e:
                 print(f"Error in continuous listen: {e}")
                 time.sleep(0.5)
+        
+        # --- FIX STARTS HERE ---
+        # Conversation mode has ended (either by timer or error).
+        # This thread is now responsible for safely returning to wake word listening.
+        listener.start()
+        app.after(0, lambda: app.set_status(f"Listening for '{assistant_name}'", "listening"))
+        # --- FIX ENDS HERE ---
 
     def on_wake_word():
         """
         This callback runs on the listener thread.
-        Cancel any existing timer and start interaction.
         """
         cancel_wait_timer()
         interaction_thread = threading.Thread(target=handle_interaction, daemon=True)
