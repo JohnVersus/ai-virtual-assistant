@@ -4,24 +4,24 @@ This file outlines the next steps to complete the AI Virtual Assistant project.
 
 ### Core Functionality
 
-- [ ] **Integrate ElevenLabs API**:
+- [x] **Integrate ElevenLabs API**:
 
-  - [ ] Create a module `tts.py` to handle text-to-speech conversion.
-  - [ ] Add a function that takes text and returns playable audio data.
-  - [ ] Implement audio playback within the `app.py` after receiving a response from the LLM.
+  - [x] Create a module `tts.py` to handle text-to-speech conversion.
+  - [x] Add a function that takes text and returns playable audio data.
+  - [x] Implement audio playback within the `app.py` after receiving a response from the LLM.
 
-- [ ] **Integrate Gemini API**:
-  - [ ] Create a module `llm.py` to communicate with the Gemini API.
-  - [ ] Add a function that takes a user's prompt (text) and returns the model's response.
-  - [ ] After the wake word is detected, capture the follow-up command from the user.
-  - [ ] Send the captured command to the Gemini API.
+- [x] **Integrate Gemini API**:
+  - [x] Create a module `llm.py` to communicate with the Gemini API.
+  - [x] Add a function that takes a user's prompt (text) and returns the model's response.
+  - [x] After the wake word is detected, capture the follow-up command from the user.
+  - [x] Send the captured command to the Gemini API.
 
 ### UI/UX Enhancements
 
-- [ ] **Visual Feedback for Listening/Processing**:
+- [x] **Visual Feedback for Listening/Processing**:
 
-  - [ ] Change the UI to indicate when the app is actively listening for a command (after wake word).
-  - [ ] Show a processing or thinking indicator while waiting for the Gemini API response.
+  - [x] Change the UI to indicate when the app is actively listening for a command (after wake word).
+  - [x] Show a processing or thinking indicator while waiting for the Gemini API response.
   - [ ] Display the assistant's response as text in the UI in addition to playing the audio.
 
 - [ ] **Settings Page Expansion**:
