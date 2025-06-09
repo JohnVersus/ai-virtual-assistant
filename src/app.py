@@ -1,5 +1,6 @@
 # src/app.py
 import asyncio
+import re
 import threading
 from .ui.chat_gui import ChatUI
 from .core.listener import AssistantListener
@@ -12,16 +13,13 @@ class Application:
         self.settings = load_settings()
         self.assistant_name = self.settings.get('assistant_name', 'gemini')
 
-        # Core components
         self.dspy_handler = DspyHandler()
         self.listener = AssistantListener(assistant_name=self.assistant_name, callback=self.on_wake_word_detected)
 
-        # State and history management
         self.conversation_history = []
         self.is_in_conversation_mode = False
         self.wait_timer = None
 
-        # Async loop for streaming
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.run_async_loop, daemon=True)
         self.thread.start()
@@ -44,76 +42,54 @@ class Application:
     def start_wait_timer(self):
         """Starts a 15-second timer to exit conversation mode."""
         self.cancel_wait_timer()
+        def _exit_mode():
+            if self.is_in_conversation_mode:
+                print("Conversation timeout. Exiting conversation mode.")
+                self.is_in_conversation_mode = False
         
-        def exit_conversation_mode():
-            print("Conversation timeout. Exiting conversation mode.")
-            self.is_in_conversation_mode = False
-        
-        self.wait_timer = threading.Timer(15.0, exit_conversation_mode)
+        self.wait_timer = threading.Timer(15.0, _exit_mode)
         self.wait_timer.start()
 
     def on_wake_word_detected(self):
-        """Starts the initial interaction when the wake word is heard."""
-        if self.is_in_conversation_mode:
-            return
+        """Kicks off the conversation when the wake word is heard."""
+        if not self.is_in_conversation_mode:
+            threading.Thread(target=self.run_conversation, daemon=True).start()
 
-        # Stop any lingering timers and start the interaction in a new thread
-        self.cancel_wait_timer()
-        threading.Thread(target=self.handle_first_interaction, daemon=True).start()
-
-    def handle_first_interaction(self):
-        """Handles the first command after the wake word."""
+    def run_conversation(self):
+        """Manages a single, continuous conversation from start to finish."""
+        self.is_in_conversation_mode = True
         self.listener.stop()
+        print("Wake word detected. Starting conversation loop.")
         
-        command = self.process_command() # Get and process one command
-        
-        if command:
-            # If a command was successfully processed, enter continuous conversation mode
-            self.is_in_conversation_mode = True
-            threading.Thread(target=self.continuous_listen, daemon=True).start()
-        else:
-            # If no command, go back to wake word listening
-            self.is_in_conversation_mode = False
-            self.listener.start()
-            self.root.set_status(f"Listening for '{self.assistant_name}'...")
-
-    def continuous_listen(self):
-        """Listens continuously for commands while in conversation mode."""
-        print("Entered continuous conversation mode.")
-        self.start_wait_timer() # Start the 15s timer
+        self.start_wait_timer()
 
         while self.is_in_conversation_mode:
-            command = self.process_command()
-            if command:
-                # If the user speaks, reset the auto-sleep timer
-                self.start_wait_timer()
-        
-        # Loop has ended (either by timeout or error), so revert to wake word listening
-        print("Exited continuous conversation mode.")
+            self.root.set_status("Listening...")
+            command = self.listener.listen_and_transcribe()
+
+            if command and self.is_in_conversation_mode:
+                self.cancel_wait_timer()
+                
+                self.root.set_status("Processing...")
+                self.root.add_message("You", command)
+                self.conversation_history.append({"role": "user", "content": command})
+                
+                streaming_done_event = threading.Event()
+                asyncio.run_coroutine_threadsafe(
+                    self.stream_response(streaming_done_event), self.loop
+                )
+                streaming_done_event.wait()
+                
+                if self.is_in_conversation_mode:
+                    self.start_wait_timer()
+
+        print("Exiting conversation loop.")
         self.cancel_wait_timer()
         self.listener.start()
         self.root.set_status(f"Listening for '{self.assistant_name}'...")
 
-    def process_command(self):
-        """Shared logic to listen, transcribe, and process a single command."""
-        self.root.set_status("Listening...")
-        command = self.listener.listen_and_transcribe()
-
-        if command:
-            self.root.set_status("Processing...")
-            self.root.add_message("You", command)
-            self.conversation_history.append({"role": "user", "content": command})
-            
-            streaming_done_event = threading.Event()
-            asyncio.run_coroutine_threadsafe(
-                self.stream_response(streaming_done_event), self.loop
-            )
-            streaming_done_event.wait()
-        
-        return command
-
     async def stream_response(self, done_event: threading.Event):
-        """Streams the LLM response to the UI."""
+        """Streams the LLM response to the UI and signals completion."""
         self.root.start_assistant_message()
         full_response = ""
         history_to_send = self.conversation_history[-10:]
@@ -123,6 +99,20 @@ class Application:
                 full_response += chunk
                 self.root.update_assistant_message(chunk)
             
+            # If streaming produced an empty response, silently try to recover it.
+            if not full_response.strip():
+                try:
+                    last_interaction = self.dspy_handler.lm.history[-1]
+                    raw_content = last_interaction['response'].choices[0].message.content
+                    match = re.search(r'\[\[ ## answer ## \]\](.*)\[\[ ## completed ## \]\]', raw_content, re.DOTALL)
+                    if match:
+                        fallback_answer = match.group(1).strip()
+                        self.root.update_assistant_message(fallback_answer)
+                        full_response = fallback_answer
+                except Exception:
+                    # If fallback fails, do so silently. The user will see no response.
+                    pass
+            
             self.root.end_assistant_message()
             if full_response.strip():
                 self.conversation_history.append({"role": "assistant", "content": full_response})
@@ -130,6 +120,7 @@ class Application:
             error_message = f"\n[Error: {e}]"
             print(f"Error streaming response: {e}")
             self.root.update_assistant_message(error_message)
+            self.is_in_conversation_mode = False
         finally:
             done_event.set()
 

@@ -1,6 +1,6 @@
 # src/core/dspy_handler.py
 import dspy
-from dspy.streaming import StreamResponse # Corrected import path
+from dspy.streaming import StreamResponse
 from ..config.settings import load_settings
 
 class GenerateResponse(dspy.Signature):
@@ -38,9 +38,6 @@ class DspyHandler:
         """
         output_stream = self.stream_predictor(history=history)
 
-        # The stream yields StreamResponse objects first, and a Prediction object last.
-        # We must check the type before trying to access attributes.
         async for item in output_stream:
             if isinstance(item, StreamResponse):
                 yield item.chunk
-            # We can safely ignore the final Prediction object.
