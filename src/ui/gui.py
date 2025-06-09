@@ -1,31 +1,32 @@
+# src/ui/gui.py
 import tkinter as tk
 from tkinter import ttk, messagebox
 from ..config.settings import save_settings, load_settings
 
 class ModernUI(tk.Tk):
-    def __init__(self, listener_callback):
+    def __init__(self):
         super().__init__()
         self.title("AI Virtual Assistant")
         self.geometry("350x200")
-        self.listener_callback = listener_callback
 
         self.settings = load_settings()
 
-        # Style
         style = ttk.Style(self)
-        style.theme_use('aqua') # 'aqua' is a modern theme on macOS
+        style.theme_use('aqua')
         style.configure("TLabel", padding=10, font=("Helvetica", 14))
         style.configure("TButton", padding=10, font=("Helvetica", 12))
 
-        # Main frame
         main_frame = ttk.Frame(self, padding="20")
         main_frame.pack(expand=True, fill="both")
 
-        self.status_label = ttk.Label(main_frame, text="Status: Listening...", anchor="center")
+        self.status_label = ttk.Label(main_frame, text="Status: Initializing...", anchor="center")
         self.status_label.pack(pady=10)
 
         settings_button = ttk.Button(main_frame, text="Settings", command=self.open_settings)
         settings_button.pack(pady=10)
+
+    def set_status(self, text):
+        self.status_label.config(text=f"Status: {text}")
 
     def open_settings(self):
         settings_window = tk.Toplevel(self)
@@ -53,11 +54,3 @@ class ModernUI(tk.Tk):
             window.destroy()
         else:
             messagebox.showwarning("Invalid Name", "Assistant name cannot be empty.")
-
-    def on_activation(self):
-        # This function is called when the wake word is detected
-        self.status_label.config(text="Status: Activated!")
-        # Add logic here to interact with the assistant
-        print("UI has been notified of activation.")
-        # Reset status after a delay
-        self.after(2000, lambda: self.status_label.config(text="Status: Listening..."))

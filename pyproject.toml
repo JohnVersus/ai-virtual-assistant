@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "elevenlabs>=2.3.0",
+    "google-genai>=1.19.0",
     "py2app>=0.28.8",
     "pyaudio>=0.2.14",
     "speechrecognition>=3.14.3",
