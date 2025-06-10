@@ -33,7 +33,7 @@ class Application:
         self.root.set_status(f"Listening for '{self.assistant_name}'...")
         
         # --- UI Settings Integration ---
-        self.root.set_initial_assistant_name_for_modal(self.assistant_name)
+        self.root.update_settings_for_modal(self.settings)
         self.root.save_settings_callback = self._on_save_settings_from_ui
 
     def run_async_loop(self):
@@ -154,24 +154,54 @@ class Application:
         finally:
             done_event.set()
 
-    def _on_save_settings_from_ui(self, new_assistant_name: str):
+    def _on_save_settings_from_ui(self, new_settings: dict):
         """Callback to save settings from the UI."""
         old_assistant_name = self.assistant_name
-        self.assistant_name = new_assistant_name
+        old_mcp_use_external = self.settings.get('mcp_use_external_python_server', False)
+        old_mcp_script_path = self.settings.get('mcp_external_python_script_path', '')
+
+        # Update assistant name from new_settings
+        self.assistant_name = new_settings.get('assistant_name', self.assistant_name)
         
-        self.settings['assistant_name'] = new_assistant_name
+        # Update all settings in self.settings
+        self.settings.update(new_settings)
         save_settings(self.settings)
 
-        if old_assistant_name != new_assistant_name:
-            print(f"Assistant name changed from '{old_assistant_name}' to '{new_assistant_name}'. Restarting listener.")
+        name_changed = old_assistant_name != self.assistant_name
+        mcp_settings_changed = (
+            old_mcp_use_external != self.settings.get('mcp_use_external_python_server') or
+            old_mcp_script_path != self.settings.get('mcp_external_python_script_path')
+        )
+
+        if name_changed or mcp_settings_changed:
+            print("Settings changed, re-initializing services...")
             self.listener.stop() 
-            self.listener = AssistantListener(assistant_name=self.assistant_name, callback=self.on_wake_word_detected)
+
+            if mcp_settings_changed:
+                print("MCP settings changed. Re-initializing DspyHandler.")
+                if self.dspy_handler:
+                    # Ensure shutdown is called in the correct async context and waited for
+                    shutdown_future = asyncio.run_coroutine_threadsafe(self.dspy_handler.shutdown(), self.loop)
+                    try:
+                        shutdown_future.result(timeout=10) # Block until shutdown completes
+                        print("DspyHandler shutdown complete.")
+                    except asyncio.TimeoutError:
+                        print("DspyHandler shutdown timed out.")
+                    except Exception as e:
+                        print(f"Error during DspyHandler shutdown: {e}")
+                
+                self.dspy_handler = DspyHandler() # New instance picks up new settings
+                print("New DspyHandler initialized.")
+
+            # Re-initialize listener if name changed or if it needs to be robustly restarted after DspyHandler change
+            self.listener = AssistantListener(assistant_name=self.assistant_name, callback=self.on_wake_word_detected) # Recreate
             self.listener.start()
             self.root.set_status(f"Listening for '{self.assistant_name}'...")
         else:
             self.root.set_status(f"Listening for '{self.assistant_name}'...")
+        
         print("Settings saved successfully.")
-        self.root.set_initial_assistant_name_for_modal(self.assistant_name)
+        self.root.update_settings_for_modal(self.settings) # Update UI modal with latest settings
 
     def on_closing(self):
         """Handles application cleanup and shutdown."""
@@ -179,10 +209,22 @@ class Application:
         self.is_in_conversation_mode = False
         self.cancel_wait_timer()
         self.listener.stop()
+        
+        async def perform_async_shutdown():
+            if self.dspy_handler:
+                await self.dspy_handler.shutdown()
 
-        self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.loop and self.loop.is_running():
+            # Schedule async shutdown and then stop the loop
+            asyncio.run_coroutine_threadsafe(perform_async_shutdown(), self.loop).result(timeout=10)
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        elif self.dspy_handler: # If loop not running, try sync context
+            asyncio.run(perform_async_shutdown())
+
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=5)
+
         self.root.destroy()
-
 def main():
     root = ChatUI()
     app = Application(root)
