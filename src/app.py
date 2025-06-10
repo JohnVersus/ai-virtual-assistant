@@ -67,20 +67,30 @@ class Application:
         """Manages a single, continuous conversation from start to finish."""
         self.is_in_conversation_mode = True
         self.listener.stop()
-        print("Wake word detected. Starting conversation loop.")
+        print("Wake word detected. Starting conversation.")
         
+        # Start the inactivity timer for the first command attempt.
         self.start_wait_timer()
 
         while self.is_in_conversation_mode:
             self.root.set_status("Listening...")
+
+            # Cancel any active inactivity timer before blocking to listen.
+            # The listener has its own timeout for speech to *start*.
+            # The 15s timer is for inactivity *between* full interaction turns.
+            self.cancel_wait_timer()
+
             command = self.listener.listen_and_transcribe()
 
-            if command and self.is_in_conversation_mode:
-                self.cancel_wait_timer()
-                
+            if not self.is_in_conversation_mode:
+                # Conversation mode might have been set to False by the timer expiring
+                # (e.g., if previous listen attempt yielded no command, timer started, then expired).
+                print("Conversation mode ended (likely by inactivity timer).")
+                break
+
+            if command: # A command was successfully transcribed
                 self.root.add_message("You", command)
                 self.conversation_history.append({"role": "user", "content": command})
-                
                 streaming_done_event = threading.Event()
                 asyncio.run_coroutine_threadsafe(
                     self.stream_response(streaming_done_event), self.loop
@@ -88,9 +98,24 @@ class Application:
                 streaming_done_event.wait()
                 
                 if self.is_in_conversation_mode:
+                    # After a successful interaction, restart the inactivity timer for the next turn.
+                    print("Command processed. Starting inactivity timer for next turn.")
                     self.start_wait_timer()
+                else:
+                    # Conversation mode was set to False during streaming (e.g., by an error)
+                    print("Conversation mode ended during or after streaming response.")
+                    break
+            else:
+                # No command heard (e.g., listener's internal timeout for speech to start expired)
+                if self.is_in_conversation_mode:
+                    print("No command heard in this attempt. Restarting inactivity timer.")
+                    self.start_wait_timer() # User was silent, so restart main inactivity timer.
+                else:
+                    # Already exited (e.g. timer from a previous failed attempt expired)
+                    print("No command heard and conversation mode already exited.")
+                    break
 
-        print("Exiting conversation loop.")
+        print("Exited conversation loop.")
         self.cancel_wait_timer()
         self.listener.start()
         self.root.set_status(f"Listening for '{self.assistant_name}'...")

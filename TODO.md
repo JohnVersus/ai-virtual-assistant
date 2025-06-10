@@ -22,7 +22,7 @@ This file outlines the next steps to complete the AI Virtual Assistant project.
 
   - [x] Change the UI to indicate when the app is actively listening for a command (after wake word).
   - [x] Show a processing or thinking indicator while waiting for the Gemini API response.
-  - [ ] Display the assistant's response as text in the UI in addition to playing the audio.
+  - [x] Display the assistant's response as text in the UI in addition to playing the audio.
 
 - [ ] **Settings Page Expansion**:
   - [ ] Add fields to the settings page for users to enter their own API keys for ElevenLabs and Gemini.

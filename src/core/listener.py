@@ -8,6 +8,7 @@ class AssistantListener:
         self.recognizer = sr.Recognizer()
         self.microphone = sr.Microphone()
         self.stop_listening = None
+        self.recognizer.pause_threshold = 2.0
 
         # Adjust for ambient noise once at the beginning
         with self.microphone as source:
@@ -49,7 +50,9 @@ class AssistantListener:
         print("Listening for a command...")
         try:
             with self.microphone as source:
-                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
+                # Removed phrase_time_limit to allow pause_threshold to dictate end of speech.
+                # timeout=5 means it will wait 5s for speech to start.
+                audio = self.recognizer.listen(source, timeout=5)
 
             text = self.recognizer.recognize_google(audio)
             print(f"Command transcribed: '{text}'")
