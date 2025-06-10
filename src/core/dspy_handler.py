@@ -32,14 +32,15 @@ class GenerateResponse(dspy.Signature):
 class DspyHandler:
     def __init__(self):
         self.settings = load_settings()
-        self.lm = self._setup_dspy_lm()
-        self.mcp_server_process = None
+        self.lm = self._setup_dspy_lm() # LM setup is independent of MCP servers
+        
+        self.active_mcp_servers = [] # List to store Popen objects for stdio servers
+        self.active_mcp_sessions = [] # List to store ClientSessionContextManagers
+
         self.dspy_tools = []
         self.react_agent = None
         self.fallback_predictor = None
         self.fallback_stream_predictor = None
-
-        self.mcp_client_session_manager = None # To manage the MCP client session context
 
         self._initialize_mcp_and_agent()
 
@@ -47,18 +48,16 @@ class DspyHandler:
         """Determines the path to the mcp_tools_server.py script."""
         # For PyInstaller, sys._MEIPASS is the temp folder where bundled files are
         if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            # Assuming mcp_tools_server.py is bundled into 'src/core' relative to executable
-            return os.path.join(sys._MEIPASS, 'src', 'core', 'mcp_tools_server.py')
+            # Expect mcp_tools_server.py at the root of the bundle
+            return os.path.join(sys._MEIPASS, 'mcp_tools_server.py')
         else: # Running as a normal script
             # Correct path assuming dspy_handler.py and mcp_tools_server.py are in the same directory
             return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mcp_tools_server.py')
 
     def _start_mcp_server(self, command_list: list, env_vars: dict = None):
         """Starts an MCP server using the provided command list and optional environment variables."""
-        if self.mcp_server_process and self.mcp_server_process.poll() is None:
-            print("MCP server already running.")
-            return True
-
+        # This method will now return the Popen object or None
+        
         # For local Python script, ensure the first element (python executable) is valid
         # For external commands, command_list[0] is the command itself.
         if command_list[0] == sys.executable and not os.path.exists(command_list[1]):
@@ -74,7 +73,7 @@ class DspyHandler:
             current_env.update(env_vars)
 
         try:
-            self.mcp_server_process = subprocess.Popen(
+            mcp_server_process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -84,26 +83,24 @@ class DspyHandler:
                 close_fds=sys.platform != "win32",
                 env=current_env
             )
-            print(f"MCP server process starting with PID: {self.mcp_server_process.pid}")
+            print(f"MCP server process starting with PID: {mcp_server_process.pid} for command: {' '.join(command_list)}")
             # Log MCP server output for debugging
-            threading.Thread(target=self._log_subprocess_output, args=(self.mcp_server_process.stdout, "MCP_OUT"), daemon=True).start()
-            threading.Thread(target=self._log_subprocess_output, args=(self.mcp_server_process.stderr, "MCP_ERR"), daemon=True).start()
+            threading.Thread(target=self._log_subprocess_output, args=(mcp_server_process.stdout, f"MCP_OUT_{mcp_server_process.pid}"), daemon=True).start()
+            threading.Thread(target=self._log_subprocess_output, args=(mcp_server_process.stderr, f"MCP_ERR_{mcp_server_process.pid}"), daemon=True).start()
 
             time.sleep(3) # Give server a moment to start
-            if self.mcp_server_process.poll() is not None: # Check if process terminated prematurely
-                print(f"MCP server failed to stay running. Exit code: {self.mcp_server_process.returncode}")
+            if mcp_server_process.poll() is not None: # Check if process terminated prematurely
+                print(f"MCP server for {' '.join(command_list)} failed to stay running. Exit code: {mcp_server_process.returncode}")
                 # Attempt to read stderr for more clues
                 # err_output = self.mcp_server_process.stderr.read() if self.mcp_server_process.stderr else "N/A"
                 # print(f"MCP Server stderr: {err_output}")
-                raise RuntimeError(f"MCP server failed to stay running. Exit code: {self.mcp_server_process.returncode}")
-            print("MCP server assumed to be running.")
-            return True
+                # raise RuntimeError(f"MCP server failed to stay running. Exit code: {mcp_server_process.returncode}") # Don't raise, just return None
+                return None
+            print(f"MCP server for {' '.join(command_list)} assumed to be running.")
+            return mcp_server_process
         except Exception as e:
-            print(f"Failed to start MCP server: {e}")
-            if self.mcp_server_process:
-                self.mcp_server_process.terminate()
-            self.mcp_server_process = None
-            return False
+            print(f"Failed to start MCP server for {' '.join(command_list)}: {e}")
+            return None
 
     def _log_subprocess_output(self, pipe, prefix):
         try:
@@ -117,25 +114,98 @@ class DspyHandler:
             if hasattr(pipe, 'close') and not pipe.closed:
                 pipe.close()
 
-    async def _initialize_tools_async(self):
-        """Initializes MCP client, loads tools, and keeps the session for ReAct."""
-        if not self.mcp_server_process or self.mcp_server_process.poll() is not None:
-            print("MCP server not running. Cannot initialize tools for ReAct.")
-            return []
+    async def _initialize_tools_from_server(self, mcp_popen_process, server_id: str):
+        """Initializes MCP client for a given server process, loads its tools."""
+        if not mcp_popen_process or mcp_popen_process.poll() is not None:
+            print(f"MCP server process for '{server_id}' not running. Cannot initialize tools.")
+            return [], None
 
-        server_params = StdioServerParameters(command_or_popen_obj=self.mcp_server_process)
-        
-        # Create and enter the async context manager for the client session
-        self.mcp_client_session_manager = ClientSessionContextManager(server_params)
-        session = await self.mcp_client_session_manager.get_session()
+        server_params = StdioServerParameters(command_or_popen_obj=mcp_popen_process)
+        session_manager = ClientSessionContextManager(server_params)
+        session = await session_manager.get_session()
 
         if not session:
-            print("Failed to establish MCP session.")
-            return []
+            print(f"Failed to establish MCP session for server '{server_id}'.")
+            await session_manager.close_session() # Clean up client if session failed
+            return [], None
 
-        tool_list_response = await session.list_tools()
-        dspy_tools = [dspy.Tool.from_mcp_tool(session, tool_spec) for tool_spec in tool_list_response.tools]
-        print(f"Loaded {len(dspy_tools)} MCP tools for ReAct using persistent session.")
+        try:
+            tool_list_response = await session.list_tools()
+            dspy_tools = [dspy.Tool.from_mcp_tool(session, tool_spec) for tool_spec in tool_list_response.tools]
+            print(f"Loaded {len(dspy_tools)} MCP tools from server '{server_id}'.")
+            return dspy_tools, session_manager
+        except Exception as e:
+            print(f"Error listing or converting tools from server '{server_id}': {e}")
+            await session_manager.close_session()
+            return [], None
+
+    def _initialize_mcp_and_agent(self):
+        self.dspy_tools = []
+        self.active_mcp_servers = []
+        self.active_mcp_sessions = []
+
+        mcp_server_configs = self.settings.get("mcp_servers", [])
+        if not isinstance(mcp_server_configs, list):
+            print("Warning: 'mcp_servers' in settings is not a list. No MCP servers will be loaded.")
+            mcp_server_configs = []
+
+        all_loaded_dspy_tools = []
+
+        for config in mcp_server_configs:
+            if not config.get("enabled", False):
+                print(f"MCP Server '{config.get('id', 'Unknown')}' is disabled. Skipping.")
+                continue
+
+            server_type = config.get("type")
+            server_id = config.get("id", "UnnamedServer")
+
+            if server_type == "stdio":
+                command = config.get("command")
+                args = config.get("args", [])
+                env = config.get("env")
+
+                if command:
+                    full_command = [command] + args
+                    mcp_process = self._start_mcp_server(command_list=full_command, env_vars=env)
+                    if mcp_process:
+                        self.active_mcp_servers.append(mcp_process)
+                        # Initialize tools and session for this server
+                        # This part needs to be async, so we'll collect tools later or adapt
+                        # For now, let's assume we can run this part of init in a way that blocks or uses event loop
+                        
+                        # Running async tool initialization:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            future = asyncio.run_coroutine_threadsafe(self._initialize_tools_from_server(mcp_process, server_id), loop)
+                            tools_from_this_server, session_mgr = future.result(timeout=15)
+                        else:
+                            tools_from_this_server, session_mgr = loop.run_until_complete(self._initialize_tools_from_server(mcp_process, server_id))
+                        
+                        if tools_from_this_server and session_mgr:
+                            all_loaded_dspy_tools.extend(tools_from_this_server)
+                            self.active_mcp_sessions.append(session_mgr)
+                else:
+                    print(f"stdio MCP Server '{server_id}' is missing 'command'. Skipping.")
+            
+            elif server_type == "http":
+                print(f"HTTP MCP Server '{server_id}' configuration found. HTTP tool loading is not yet fully implemented in this handler. Skipping.")
+                # Placeholder for future HTTP MCP client logic and dspy.Tool wrapping
+            
+            else:
+                print(f"Unknown MCP Server type '{server_type}' for server '{server_id}'. Skipping.")
+
+        self.dspy_tools = all_loaded_dspy_tools
+
+        if self.dspy_tools:
+            self.react_agent = dspy.ReAct(ExecuteTaskWithTools, tools=self.dspy_tools, lm=self.lm)
+            print(f"ReAct agent initialized with {len(self.dspy_tools)} total MCP tools from all active servers.")
+        else:
+            print("No MCP tools loaded from any server. ReAct agent will not have tools.")
+            self._setup_fallback_predictor()
+
+    def _setup_fallback_predictor(self):
+        print("No MCP tools loaded or MCP server failed. Setting up fallback DSPy predictor.")
+        self.fallback_predictor = dspy.Predict(GenerateResponse)
         return dspy_tools
 
     def _initialize_mcp_and_agent(self):
@@ -228,20 +298,16 @@ class DspyHandler:
 
         if self.react_agent and self.dspy_tools:
             print(f"Using ReAct agent for request: {user_request}")
+            # Note: ReAct with tools from multiple MCP servers.
+            # The dspy.Tool objects created by from_mcp_tool hold a reference to their session.
+            # So, ReAct should be able to call the correct server via the tool's session.
             try:
-                # ReAct needs the session from mcp_client_session_manager to be active
-                if not self.mcp_client_session_manager or not await self.mcp_client_session_manager.is_active():
-                    print("MCP session not active. Attempting to re-initialize.")
-                    # This is a simplified recovery; robust recovery is more complex
-                    self.dspy_tools = await self._initialize_tools_async()
-                    if not self.dspy_tools:
-                        raise RuntimeError("Failed to re-initialize MCP tools for ReAct.")
-                    self.react_agent = dspy.ReAct(ExecuteTaskWithTools, tools=self.dspy_tools, lm=self.lm)
-
                 prediction = await self.react_agent.acall(user_request=user_request)
                 final_answer = prediction.answer
                 # print(f"ReAct Trajectory: {prediction.trajectory}") # For debugging
                 # Stream the final answer
+                # Ensure final_answer is a string
+                final_answer = str(final_answer) if final_answer is not None else "No answer from agent."
                 for i in range(0, len(final_answer), 10): # Chunk for streaming effect
                     yield final_answer[i:i+10]
                     await asyncio.sleep(0.01)
@@ -260,21 +326,24 @@ class DspyHandler:
     async def shutdown(self):
         """Shuts down the DspyHandler, including the MCP server and client session."""
         print("Shutting down DspyHandler...")
-        if self.mcp_client_session_manager:
-            await self.mcp_client_session_manager.close_session()
-            self.mcp_client_session_manager = None
+        
+        for session_manager in self.active_mcp_sessions:
+            if session_manager:
+                await session_manager.close_session()
+        self.active_mcp_sessions = []
 
-        if self.mcp_server_process:
-            print("Terminating MCP server process...")
-            self.mcp_server_process.terminate()
-            try:
-                self.mcp_server_process.wait(timeout=5)
-                print("MCP server process terminated.")
-            except subprocess.TimeoutExpired:
-                print("MCP server process did not terminate in time, killing.")
-                self.mcp_server_process.kill()
-                self.mcp_server_process.wait()
-            self.mcp_server_process = None
+        for mcp_server_proc in self.active_mcp_servers:
+            if mcp_server_proc and mcp_server_proc.poll() is None:
+                print(f"Terminating MCP server process PID: {mcp_server_proc.pid}...")
+                mcp_server_proc.terminate()
+                try:
+                    mcp_server_proc.wait(timeout=5)
+                    print(f"MCP server process PID: {mcp_server_proc.pid} terminated.")
+                except subprocess.TimeoutExpired:
+                    print(f"MCP server process PID: {mcp_server_proc.pid} did not terminate in time, killing.")
+                    mcp_server_proc.kill()
+                    mcp_server_proc.wait()
+        self.active_mcp_servers = []
 
 # Helper class to manage MCP ClientSession lifecycle for ReAct
 class ClientSessionContextManager:

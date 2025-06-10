@@ -9,7 +9,8 @@ from .core.listener import AssistantListener # pyaudio is likely used by Assista
 from .ui.chat_gui import ChatUI
 from .core.listener import AssistantListener
 from .core.dspy_handler import DspyHandler
-from .config.settings import load_settings, save_settings
+from .config.settings import load_settings, save_settings_from_string, save_settings_from_dict
+import json # For converting dict to json string for UI
 
 class Application:
     def __init__(self, root):
@@ -33,7 +34,8 @@ class Application:
         self.root.set_status(f"Listening for '{self.assistant_name}'...")
         
         # --- UI Settings Integration ---
-        self.root.update_settings_for_modal(self.settings)
+        initial_settings_json_str = json.dumps(self.settings, indent=4)
+        self.root.update_settings_json_for_modal(initial_settings_json_str)
         self.root.save_settings_callback = self._on_save_settings_from_ui
 
     def run_async_loop(self):
@@ -154,54 +156,91 @@ class Application:
         finally:
             done_event.set()
 
-    def _on_save_settings_from_ui(self, new_settings: dict):
+    def _on_save_settings_from_ui(self, new_settings_json_str: str):
         """Callback to save settings from the UI."""
-        old_assistant_name = self.assistant_name
-        old_mcp_use_external = self.settings.get('mcp_use_external_python_server', False)
-        old_mcp_script_path = self.settings.get('mcp_external_python_script_path', '')
-
-        # Update assistant name from new_settings
-        self.assistant_name = new_settings.get('assistant_name', self.assistant_name)
+        print("Settings save initiated from UI...")
         
-        # Update all settings in self.settings
-        self.settings.update(new_settings)
-        save_settings(self.settings)
+        try:
+            new_settings_dict = json.loads(new_settings_json_str)
+        except json.JSONDecodeError:
+            print("Error: Invalid JSON received from UI. Settings not saved.")
+            # Optionally, inform the user via UI as well
+            self.root.set_status("Error: Invalid JSON in settings. Not saved.")
+            return
 
-        name_changed = old_assistant_name != self.assistant_name
-        mcp_settings_changed = (
-            old_mcp_use_external != self.settings.get('mcp_use_external_python_server') or
-            old_mcp_script_path != self.settings.get('mcp_external_python_script_path')
-        )
+        # Deep compare old and new settings to see if re-initialization is needed
+        # For simplicity, we'll re-initialize if any part of the settings dict changes.
+        # A more granular check could be implemented for specific keys like 'assistant_name' or 'mcp_servers'.
+        settings_changed = self.settings != new_settings_dict
 
-        if name_changed or mcp_settings_changed:
-            print("Settings changed, re-initializing services...")
-            self.listener.stop() 
+        if settings_changed:
+            print("Settings have changed. Applying and re-initializing services.")
+            self.settings = new_settings_dict # Update internal settings
+            self.assistant_name = self.settings.get('assistant_name', 'gemini') # Update assistant name
+            save_settings_from_dict(self.settings) # Save the new dictionary
+            print("Settings saved to file.")
 
-            if mcp_settings_changed:
-                print("MCP settings changed. Re-initializing DspyHandler.")
-                if self.dspy_handler:
-                    # Ensure shutdown is called in the correct async context and waited for
-                    shutdown_future = asyncio.run_coroutine_threadsafe(self.dspy_handler.shutdown(), self.loop)
-                    try:
-                        shutdown_future.result(timeout=10) # Block until shutdown completes
-                        print("DspyHandler shutdown complete.")
-                    except asyncio.TimeoutError:
-                        print("DspyHandler shutdown timed out.")
-                    except Exception as e:
-                        print(f"Error during DspyHandler shutdown: {e}")
-                
-                self.dspy_handler = DspyHandler() # New instance picks up new settings
-                print("New DspyHandler initialized.")
-
-            # Re-initialize listener if name changed or if it needs to be robustly restarted after DspyHandler change
-            self.listener = AssistantListener(assistant_name=self.assistant_name, callback=self.on_wake_word_detected) # Recreate
-            self.listener.start()
-            self.root.set_status(f"Listening for '{self.assistant_name}'...")
+            self.root.set_status("Applying settings changes...")
+            # Schedule the re-initialization sequence to run on the main Tkinter thread
+            # For simplicity, always pass True for both flags if settings_changed is True,
+            # as DspyHandler and Listener might both need updates.
+            self.root.after_idle(lambda: self._execute_reinitialization_sequence(True, True))
         else:
+            print("No settings changed that require service re-initialization.")
             self.root.set_status(f"Listening for '{self.assistant_name}'...")
+            # Update modal with the (potentially re-formatted) JSON string
+            self.root.update_settings_json_for_modal(json.dumps(self.settings, indent=4))
+
+    def _execute_reinitialization_sequence(self, name_changed_flag, mcp_settings_changed_flag):
+        """Executes the re-initialization steps on the main thread."""
+        print("MainThread: Executing re-initialization sequence...")
+        self.listener.stop()
+        print("MainThread: Listener stopped for re-initialization.")
+
+        if mcp_settings_changed_flag:
+            print("MainThread: MCP settings changed. Preparing to shutdown DspyHandler.")
+            if self.dspy_handler:
+                print("MainThread: Scheduling DspyHandler shutdown via asyncio loop...")
+                async def _shutdown_task():
+                    await self.dspy_handler.shutdown()
+
+                shutdown_future = asyncio.run_coroutine_threadsafe(_shutdown_task(), self.loop)
+                
+                def _on_dspy_shutdown_done(future):
+                    try:
+                        future.result() 
+                        print("AsyncioThread: DspyHandler shutdown successfully completed.")
+                    except Exception as e:
+                        print(f"AsyncioThread: Error during DspyHandler shutdown: {e}")
+                    finally:
+                        self.root.after_idle(lambda: self._continue_reinitialization_after_dspy_shutdown(name_changed_flag, mcp_settings_changed_flag))
+                
+                shutdown_future.add_done_callback(_on_dspy_shutdown_done)
+            else: # No old DspyHandler to shut down
+                self.root.after_idle(lambda: self._continue_reinitialization_after_dspy_shutdown(name_changed_flag, mcp_settings_changed_flag))
+        else: # MCP settings didn't change
+            print("MainThread: MCP settings did not change.")
+            self.root.after_idle(lambda: self._continue_reinitialization_after_dspy_shutdown(name_changed_flag, mcp_settings_changed_flag))
+
+    def _continue_reinitialization_after_dspy_shutdown(self, name_changed_flag, mcp_settings_changed_flag):
+        """Continues re-initialization on the main thread after DspyHandler shutdown (if any)."""
+        print(f"MainThread: Continuing re-initialization. Name changed: {name_changed_flag}, MCP changed: {mcp_settings_changed_flag}")
+        if mcp_settings_changed_flag:
+            print("MainThread: Re-initializing DspyHandler...")
+            self.dspy_handler = DspyHandler() # This is in the main thread
+            print("MainThread: New DspyHandler initialized.")
+
+        if name_changed_flag:
+            print("MainThread: Assistant name changed. Re-initializing AssistantListener...")
+            self.listener = AssistantListener(assistant_name=self.assistant_name, callback=self.on_wake_word_detected)
+            print("MainThread: AssistantListener re-initialized.")
         
-        print("Settings saved successfully.")
-        self.root.update_settings_for_modal(self.settings) # Update UI modal with latest settings
+        print("MainThread: Starting AssistantListener...")
+        self.listener.start() 
+
+        self.root.set_status(f"Listening for '{self.assistant_name}'...")
+        self.root.update_settings_json_for_modal(json.dumps(self.settings, indent=4)) # Update UI modal
+        print("MainThread: Services re-initialized and UI updated.")
 
     def on_closing(self):
         """Handles application cleanup and shutdown."""
